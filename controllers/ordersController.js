@@ -6,7 +6,7 @@ const { Resend } = require("resend");
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
-const EMAIL_FROM = process.env.EMAIL_FROM; // example: BuzzyMuzzy <onboarding@resend.dev>
+const EMAIL_FROM = process.env.EMAIL_FROM; // set to: onboarding@resend.dev (for now)
 
 function escapeHtml(str = "") {
   return String(str)
@@ -54,17 +54,28 @@ function buildItemsHtml(items = []) {
   `;
 }
 
+// ✅ IMPORTANT: make Resend failures throw + log id
 async function sendEmail({ to, subject, html }) {
-  return resend.emails.send({
+  const result = await resend.emails.send({
     from: EMAIL_FROM,
     to,
     subject,
     html,
   });
+
+  // Resend SDK returns { data, error }
+  if (result?.error) {
+    console.error("❌ Resend send error:", result.error);
+    throw new Error(result.error.message || "Resend send failed");
+  }
+
+  console.log("✅ Resend sent:", { to, id: result?.data?.id });
+  return result;
 }
 
 exports.createOrder = async (req, res) => {
   try {
+    // Auth check
     if (!req.user?._id) {
       return res.status(401).json({ message: "Unauthorized" });
     }
@@ -76,31 +87,37 @@ exports.createOrder = async (req, res) => {
       return res.status(400).json({ message: "Customer email is required" });
     }
 
-    if (!process.env.RESEND_API_KEY) {
-      return res.status(500).json({ message: "RESEND_API_KEY missing" });
+    // Env sanity
+    const missing = [];
+    if (!process.env.RESEND_API_KEY) missing.push("RESEND_API_KEY");
+    if (!EMAIL_FROM) missing.push("EMAIL_FROM");
+    if (!ADMIN_EMAIL) missing.push("ADMIN_EMAIL");
+
+    if (missing.length) {
+      console.error("Missing email env vars:", missing);
+      return res.status(500).json({ message: "Email config missing", missing });
     }
 
-    if (!ADMIN_EMAIL) {
-      return res.status(500).json({ message: "ADMIN_EMAIL missing" });
-    }
-
-    if (!EMAIL_FROM) {
-      return res.status(500).json({ message: "EMAIL_FROM missing" });
-    }
-
+    // Load profile + cart
     const user = await Profile.findById(userId);
     const cart = await Cart.findOne({ user: userId });
 
-    if (!user) {
-      return res.status(404).json({ message: "User profile not found" });
-    }
+    if (!user) return res.status(404).json({ message: "User profile not found" });
 
     if (!cart || !cart.items || cart.items.length === 0) {
       return res.status(400).json({ message: "Cart is empty" });
     }
 
-    const createdOrders = [];
+    // Debug recipients (shows in Render logs)
+    console.log("📧 Email debug:", {
+      from: EMAIL_FROM,
+      userEmail: user.email,
+      customerEmail,
+      adminEmail: ADMIN_EMAIL,
+    });
 
+    // Create orders for all items
+    const createdOrders = [];
     for (const item of cart.items) {
       const order = await Order.create({
         user: userId,
@@ -111,14 +128,14 @@ exports.createOrder = async (req, res) => {
         description: item.description || "",
         price: item.price ?? 0,
       });
-
       createdOrders.push(order);
     }
 
+    // Build email summary
     const username = user.username || user.email;
     const itemsHtml = buildItemsHtml(cart.items);
 
-    // Email to logged-in user
+    // Send emails (if any fails, it will throw and you'll see why in logs)
     await sendEmail({
       to: user.email,
       subject: "Order Confirmation - BuzzyMuzzy",
@@ -130,7 +147,6 @@ exports.createOrder = async (req, res) => {
       `,
     });
 
-    // Email to customer email
     await sendEmail({
       to: customerEmail,
       subject: "Your BuzzyMuzzy Order Details",
@@ -143,7 +159,6 @@ exports.createOrder = async (req, res) => {
       `,
     });
 
-    // Email to admin
     await sendEmail({
       to: ADMIN_EMAIL,
       subject: `New Order Received - ${escapeHtml(username)}`,
@@ -156,6 +171,7 @@ exports.createOrder = async (req, res) => {
       `,
     });
 
+    // Clear cart after success
     cart.items = [];
     await cart.save();
 
@@ -163,9 +179,9 @@ exports.createOrder = async (req, res) => {
       message: "Order created successfully",
       orders: createdOrders,
     });
-
   } catch (error) {
     console.error("Order error full:", error);
+    console.error("Order error message:", error?.message);
 
     return res.status(500).json({
       message: "Server error",
