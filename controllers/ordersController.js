@@ -1,33 +1,12 @@
 const Order = require("../models/Order");
 const Profile = require("../models/Profile");
 const Cart = require("../models/Cart");
-const nodemailer = require("nodemailer");
+const { Resend } = require("resend");
 
-// ---- SMTP transporter (safe config) ----
-const EMAIL_HOST = process.env.EMAIL_HOST;
-const EMAIL_PORT = Number(process.env.EMAIL_PORT || 465);
-const EMAIL_USER = process.env.EMAIL_USER;
-const EMAIL_PASS = process.env.EMAIL_PASS;
+const resend = new Resend(process.env.RESEND_API_KEY);
+
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
-
-const transporter = nodemailer.createTransport({
-  host: EMAIL_HOST,
-  port: EMAIL_PORT,
-  secure: EMAIL_PORT === 465, // 465=true (SSL), 587=false (STARTTLS)
-  auth: {
-    user: EMAIL_USER,
-    pass: EMAIL_PASS,
-  },
-  connectionTimeout: 20_000,
-  greetingTimeout: 20_000,
-  socketTimeout: 20_000,
-});
-
-// Verify SMTP at startup (you'll see this in Render logs)
-transporter.verify((err) => {
-  if (err) console.error("SMTP verify failed:", err);
-  else console.log("SMTP transporter is ready");
-});
+const EMAIL_FROM = process.env.EMAIL_FROM; // example: BuzzyMuzzy <onboarding@resend.dev>
 
 function escapeHtml(str = "") {
   return String(str)
@@ -58,6 +37,7 @@ function buildItemsHtml(items = []) {
             const size = escapeHtml(item.size);
             const quantity = escapeHtml(item.quantity);
             const price = escapeHtml(item.price);
+
             return `
               <tr>
                 <td>${fileName}</td>
@@ -74,9 +54,17 @@ function buildItemsHtml(items = []) {
   `;
 }
 
+async function sendEmail({ to, subject, html }) {
+  return resend.emails.send({
+    from: EMAIL_FROM,
+    to,
+    subject,
+    html,
+  });
+}
+
 exports.createOrder = async (req, res) => {
   try {
-    // Auth check (prevents req.user crash)
     if (!req.user?._id) {
       return res.status(401).json({ message: "Unauthorized" });
     }
@@ -88,31 +76,31 @@ exports.createOrder = async (req, res) => {
       return res.status(400).json({ message: "Customer email is required" });
     }
 
-    // Env sanity (helps catch prod misconfig fast)
-    const missing = [];
-    if (!EMAIL_HOST) missing.push("EMAIL_HOST");
-    if (!process.env.EMAIL_PORT) missing.push("EMAIL_PORT");
-    if (!EMAIL_USER) missing.push("EMAIL_USER");
-    if (!EMAIL_PASS) missing.push("EMAIL_PASS");
-    if (!ADMIN_EMAIL) missing.push("ADMIN_EMAIL");
-
-    if (missing.length) {
-      console.error("Missing email env vars:", missing);
-      return res.status(500).json({ message: "Email config missing", missing });
+    if (!process.env.RESEND_API_KEY) {
+      return res.status(500).json({ message: "RESEND_API_KEY missing" });
     }
 
-    // Load user profile + cart
+    if (!ADMIN_EMAIL) {
+      return res.status(500).json({ message: "ADMIN_EMAIL missing" });
+    }
+
+    if (!EMAIL_FROM) {
+      return res.status(500).json({ message: "EMAIL_FROM missing" });
+    }
+
     const user = await Profile.findById(userId);
     const cart = await Cart.findOne({ user: userId });
 
-    if (!user) return res.status(404).json({ message: "User profile not found" });
+    if (!user) {
+      return res.status(404).json({ message: "User profile not found" });
+    }
 
     if (!cart || !cart.items || cart.items.length === 0) {
       return res.status(400).json({ message: "Cart is empty" });
     }
 
-    // Create orders for all items
     const createdOrders = [];
+
     for (const item of cart.items) {
       const order = await Order.create({
         user: userId,
@@ -122,18 +110,16 @@ exports.createOrder = async (req, res) => {
         quantity: item.quantity,
         description: item.description || "",
         price: item.price ?? 0,
-        // customerEmail, // optional: save if you want
       });
+
       createdOrders.push(order);
     }
 
-    // Build one email summary
     const username = user.username || user.email;
     const itemsHtml = buildItemsHtml(cart.items);
 
-    // Send 1 email to logged-in user
-    await transporter.sendMail({
-      from: EMAIL_USER,
+    // Email to logged-in user
+    await sendEmail({
       to: user.email,
       subject: "Order Confirmation - BuzzyMuzzy",
       html: `
@@ -144,9 +130,8 @@ exports.createOrder = async (req, res) => {
       `,
     });
 
-    // Send 1 email to customer email (form)
-    await transporter.sendMail({
-      from: EMAIL_USER,
+    // Email to customer email
+    await sendEmail({
       to: customerEmail,
       subject: "Your BuzzyMuzzy Order Details",
       html: `
@@ -158,21 +143,19 @@ exports.createOrder = async (req, res) => {
       `,
     });
 
-    // Send 1 email to admin
-    await transporter.sendMail({
-      from: EMAIL_USER,
+    // Email to admin
+    await sendEmail({
       to: ADMIN_EMAIL,
       subject: `New Order Received - ${escapeHtml(username)}`,
       html: `
         <h2>New Order Notification</h2>
         <p><strong>Logged-in User:</strong> ${escapeHtml(username)}</p>
-        <p><strong>Customer Email (form):</strong> ${escapeHtml(customerEmail)}</p>
+        <p><strong>Customer Email:</strong> ${escapeHtml(customerEmail)}</p>
         <hr/>
         ${itemsHtml}
       `,
     });
 
-    // Clear cart after success
     cart.items = [];
     await cart.save();
 
@@ -180,17 +163,13 @@ exports.createOrder = async (req, res) => {
       message: "Order created successfully",
       orders: createdOrders,
     });
-  } catch (error) {
-    // Render logs will show these
-    console.error("Order error full:", error);
-    console.error("Order error message:", error?.message);
-    console.error("Order error code:", error?.code);
 
-    // TEMP debug response — once fixed, remove details/code
+  } catch (error) {
+    console.error("Order error full:", error);
+
     return res.status(500).json({
       message: "Server error",
       details: error?.message,
-      code: error?.code,
     });
   }
 };
