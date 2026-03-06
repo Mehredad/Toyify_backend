@@ -1,3 +1,5 @@
+// controllers/orderController.js (or whatever your file name is)
+
 const Order = require("../models/Order");
 const Profile = require("../models/Profile");
 const Cart = require("../models/Cart");
@@ -6,7 +8,7 @@ const { Resend } = require("resend");
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
-const EMAIL_FROM = process.env.EMAIL_FROM; // set to: onboarding@resend.dev (for now)
+const EMAIL_FROM = process.env.EMAIL_FROM; // e.g. "BuzzyMuzzy <onboarding@resend.dev>"
 
 function escapeHtml(str = "") {
   return String(str)
@@ -54,7 +56,7 @@ function buildItemsHtml(items = []) {
   `;
 }
 
-// ✅ IMPORTANT: make Resend failures throw + log id
+// Resend helper (throws on failure)
 async function sendEmail({ to, subject, html }) {
   const result = await resend.emails.send({
     from: EMAIL_FROM,
@@ -65,7 +67,8 @@ async function sendEmail({ to, subject, html }) {
 
   // Resend SDK returns { data, error }
   if (result?.error) {
-    console.error("❌ Resend send error:", result.error);
+    // Log full error so you can see EXACT reason in server logs
+    console.error("❌ Resend send error FULL:", JSON.stringify(result.error, null, 2));
     throw new Error(result.error.message || "Resend send failed");
   }
 
@@ -99,10 +102,33 @@ exports.createOrder = async (req, res) => {
     }
 
     // Load profile + cart
-    const user = await Profile.findById(userId);
+    // IMPORTANT: some apps have Profile._id != User._id
+    // So we try BOTH ways to avoid breaking your setup.
+    let userProfile = await Profile.findById(userId);
+    if (!userProfile) {
+      userProfile = await Profile.findOne({ user: userId });
+    }
+
     const cart = await Cart.findOne({ user: userId });
 
-    if (!user) return res.status(404).json({ message: "User profile not found" });
+    if (!userProfile) {
+      return res.status(404).json({ message: "User profile not found" });
+    }
+
+    // Try to pick an email field safely
+    const profileEmail =
+      userProfile.email ||
+      userProfile.userEmail ||
+      userProfile.customerEmail ||
+      userProfile?.contactEmail;
+
+    if (!profileEmail) {
+      // Don't let Resend fail mysteriously
+      return res.status(400).json({
+        message: "User profile email missing",
+        hint: "Add `email` to Profile OR send user email from your User model.",
+      });
+    }
 
     if (!cart || !cart.items || cart.items.length === 0) {
       return res.status(400).json({ message: "Cart is empty" });
@@ -111,12 +137,13 @@ exports.createOrder = async (req, res) => {
     // Debug recipients (shows in Render logs)
     console.log("📧 Email debug:", {
       from: EMAIL_FROM,
-      userEmail: user.email,
+      profileEmail,
       customerEmail,
       adminEmail: ADMIN_EMAIL,
+      cartItemsCount: cart.items.length,
     });
 
-    // Create orders for all items
+    // Create orders for all items (keeps your current behavior)
     const createdOrders = [];
     for (const item of cart.items) {
       const order = await Order.create({
@@ -132,52 +159,74 @@ exports.createOrder = async (req, res) => {
     }
 
     // Build email summary
-    const username = user.username || user.email;
+    const username = userProfile.username || profileEmail;
     const itemsHtml = buildItemsHtml(cart.items);
 
-    // Send emails (if any fails, it will throw and you'll see why in logs)
-    await sendEmail({
-      to: user.email,
-      subject: "Order Confirmation - BuzzyMuzzy",
-      html: `
-        <h2>Thank you for your order, ${escapeHtml(username)}!</h2>
-        <p>Your order has been received and is being processed.</p>
-        <hr/>
-        ${itemsHtml}
-      `,
-    });
+    // Send emails BUT: do NOT fail the whole checkout if Resend fails.
+    // We'll collect errors and still return 201 so frontend isn't blocked.
+    const emailErrors = [];
 
-    await sendEmail({
-      to: customerEmail,
-      subject: "Your BuzzyMuzzy Order Details",
-      html: `
-        <h2>Your BuzzyMuzzy Order</h2>
-        <p>Thank you for placing an order!</p>
-        <hr/>
-        ${itemsHtml}
-        <p>If you did not place this order, please contact support.</p>
-      `,
-    });
+    try {
+      await sendEmail({
+        to: profileEmail,
+        subject: "Order Confirmation - Toyify",
+        html: `
+          <h2>Thank you for your order, ${escapeHtml(username)}!</h2>
+          <p>Your order has been received and is being processed.</p>
+          <hr/>
+          ${itemsHtml}
+        `,
+      });
+    } catch (e) {
+      console.error("Email failed (profile user):", e?.message);
+      emailErrors.push({ to: profileEmail, error: e?.message });
+    }
 
-    await sendEmail({
-      to: ADMIN_EMAIL,
-      subject: `New Order Received - ${escapeHtml(username)}`,
-      html: `
-        <h2>New Order Notification</h2>
-        <p><strong>Logged-in User:</strong> ${escapeHtml(username)}</p>
-        <p><strong>Customer Email:</strong> ${escapeHtml(customerEmail)}</p>
-        <hr/>
-        ${itemsHtml}
-      `,
-    });
+    try {
+      await sendEmail({
+        to: customerEmail,
+        subject: "Your Toyify Order Details",
+        html: `
+          <h2>Your Toyify Order</h2>
+          <p>Thank you for placing an order!</p>
+          <hr/>
+          ${itemsHtml}
+          <p>If you did not place this order, please contact support.</p>
+        `,
+      });
+    } catch (e) {
+      console.error("Email failed (customer):", e?.message);
+      emailErrors.push({ to: customerEmail, error: e?.message });
+    }
 
-    // Clear cart after success
+    try {
+      await sendEmail({
+        to: ADMIN_EMAIL,
+        subject: `New Order Received - ${escapeHtml(username)}`,
+        html: `
+          <h2>New Order Notification</h2>
+          <p><strong>Logged-in User:</strong> ${escapeHtml(username)}</p>
+          <p><strong>Customer Email:</strong> ${escapeHtml(customerEmail)}</p>
+          <hr/>
+          ${itemsHtml}
+        `,
+      });
+    } catch (e) {
+      console.error("Email failed (admin):", e?.message);
+      emailErrors.push({ to: ADMIN_EMAIL, error: e?.message });
+    }
+
+    // Clear cart after order creation (even if email failed)
     cart.items = [];
     await cart.save();
 
     return res.status(201).json({
-      message: "Order created successfully",
+      message:
+        emailErrors.length === 0
+          ? "Order created successfully"
+          : "Order created successfully (email sending had issues)",
       orders: createdOrders,
+      emailErrors, // helps you debug without breaking checkout
     });
   } catch (error) {
     console.error("Order error full:", error);
