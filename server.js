@@ -9,6 +9,8 @@ const aiRoutes = require("./routes/ai");
 const ordersRoutes = require("./routes/orders");
 const cartRoutes = require("./routes/cart");
 const contactRoutes = require("./routes/contactRoutes");
+const addressRoutes = require('./routes/addressRoutes');
+
 
 
 const app = express();
@@ -41,6 +43,9 @@ app.use("/api/ai", aiRoutes);
 app.use("/api/orders", ordersRoutes);
 app.use("/api/cart", cartRoutes);
 app.use("/api/contact", contactRoutes);
+app.use('/api', addressRoutes);
+
+
 
 // Health check route
 app.get("/", (req, res) => {
