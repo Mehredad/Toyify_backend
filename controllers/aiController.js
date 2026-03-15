@@ -6,6 +6,12 @@ const {
 } = require("../services/lightxService");
 const fs = require("fs");
 
+const OpenAI = require("openai");
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
 exports.generateToyPreview = async (req, res) => {
   console.log("=== Toy-preview endpoint called ===");
   console.log("Request method:", req.method);
@@ -89,17 +95,68 @@ exports.generateToyPreview = async (req, res) => {
   }
 };
 
+
+
 exports.generateToyStory = async (req, res) => {
   try {
-    const { description } = req.body;
-    const storyText = `Once upon a time, there was a toy called ${
-      description || "Polu"
-    } that went on amazing adventures!`;
-    const toyName = description || "Polu";
+    const { imageData, description } = req.body;
 
-    res.json({ story: storyText, name: toyName });
+    if (!imageData) {
+      return res.status(400).json({ message: "imageData is required" });
+    }
+
+    const prompt = `
+You are creating a product story for a child's custom toy.
+
+Look at the uploaded drawing and generate:
+1. A short cute toy name
+2. A magical, child-friendly story in 4-6 sentences
+
+Rules:
+- Base the story on what you actually see in the image
+- If a description is provided, use it only as extra context
+- Keep it warm, imaginative, and suitable for a product page
+- Return JSON only with keys: name, story
+${description ? `Extra description: ${description}` : ""}
+`;
+
+    const response = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: prompt,
+            },
+            {
+              type: "input_image",
+              image_url: imageData,
+            },
+          ],
+        },
+      ],
+    });
+
+    const text = response.output_text;
+
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = {
+        name: "Your Special Toy",
+        story: text || "This toy is ready for a magical adventure.",
+      };
+    }
+
+    return res.json({
+      name: parsed.name || "Your Special Toy",
+      story: parsed.story || "This toy is ready for a magical adventure.",
+    });
   } catch (err) {
     console.error("Toy story error:", err);
-    res.status(500).json({ message: err.message || err });
+    return res.status(500).json({ message: err.message || "Story generation failed" });
   }
 };
